@@ -90,7 +90,7 @@ Answer:
     db.add(QueryLog(
         user_id=user_id,
         query_text=query,
-        response_time_ms=str(latency)
+        response_time_ms=latency
     ))
     db.commit()
     db.close()
