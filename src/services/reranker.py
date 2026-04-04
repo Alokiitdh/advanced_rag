@@ -26,7 +26,9 @@ def rerank(query: str, documents: list, top_k: int = 5):
             truncation=True,
             return_tensors="pt"
         )
-        scores = model(**inputs).logits.squeeze()
+        scores = model(**inputs).logits.squeeze(-1)
+        if scores.dim() == 0:
+            scores = scores.unsqueeze(0)
 
     # Attach scores
     for doc, score in zip(documents, scores):

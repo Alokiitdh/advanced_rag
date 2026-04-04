@@ -2,12 +2,34 @@ import pytest
 import httpx
 import time
 import uuid
+from src.db.session import SessionLocal
+from src.db.models import User, Document, Chunk
 
 # Configuration
 BASE_URL = "http://localhost:8000"
 USER_ID = str(uuid.uuid4())
+TEST_EMAIL = f"test-{USER_ID[:8]}@test.com"
 FILENAME = "test_doc.txt"
 CONTENT = "This is a test document about the RAG pipeline. It mentions that the pipeline is working correctly."
+
+
+@pytest.fixture(autouse=True)
+def create_test_user():
+    """Create a test user in the DB before each test that needs one."""
+    db = SessionLocal()
+    user = User(id=USER_ID, email=TEST_EMAIL)
+    db.add(user)
+    db.commit()
+    db.close()
+    yield
+    # Cleanup (order matters: chunks → documents → user)
+    db = SessionLocal()
+    db.query(Chunk).filter(Chunk.user_id == USER_ID).delete()
+    db.query(Document).filter(Document.user_id == USER_ID).delete()
+    db.query(User).filter(User.id == USER_ID).delete()
+    db.commit()
+    db.close()
+
 
 def test_health_check():
     """Verify that the service is up and healthy."""

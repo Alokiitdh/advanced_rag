@@ -10,8 +10,11 @@ from src.db.models import QueryLog
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MODEL_NAME = "gpt-4o-mini"
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY")
+)
+MODEL_NAME = "google/gemini-2.0-flash-001"
 
 
 def generate_rag_answer(user_id: str, query: str, top_k: int = 5):

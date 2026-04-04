@@ -8,7 +8,10 @@ MODEL_NAME = "text-embedding-3-large"
 
 
 def generate_embedding(text: str):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY")
+    )
     response = client.embeddings.create(
         model=MODEL_NAME,
         input=text
