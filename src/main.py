@@ -12,7 +12,8 @@ from pydantic import BaseModel
 import uuid
 from src.services.retrieval import retrieve_documents
 from src.services.rag import generate_rag_answer
-from src.worker.tasks import process_document
+from arq import create_pool
+from src.worker.celery_app import get_redis_settings
 from src.services.rate_limiter import check_rate_limit
 from fastapi import HTTPException
 
@@ -20,6 +21,7 @@ from fastapi import HTTPException
 load_dotenv()
 
 app = FastAPI()
+arq_pool = None
 
 class UploadRequest(BaseModel):
     user_id: str
@@ -32,7 +34,7 @@ class QueryRequest(BaseModel):
     top_k: int = 5
 
 @app.post("/upload")
-def upload_document(request: UploadRequest):
+async def upload_document(request: UploadRequest):
 
     allowed = check_rate_limit(
         user_id=request.user_id,
@@ -43,13 +45,14 @@ def upload_document(request: UploadRequest):
     if not allowed:
         raise HTTPException(status_code=429, detail="Upload rate limit exceeded")
 
-    process_document.delay(
+    job = await arq_pool.enqueue_job(
+        "process_document",
         user_id=request.user_id,
         filename=request.filename,
         text=request.text
     )
 
-    return {"status": "queued"}
+    return {"status": "queued", "job_id": job.job_id}
 
 
 @app.post("/query")
@@ -85,9 +88,11 @@ async def health():
     return {"status": "running"}
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
+    global arq_pool
     Base.metadata.create_all(bind=engine)
     create_collection()
+    arq_pool = await create_pool(get_redis_settings())
 
 
 @app.get("/check-connections")
