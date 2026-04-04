@@ -3,6 +3,7 @@ import time
 from dotenv import load_dotenv
 from openai import OpenAI
 from src.services.retrieval import retrieve_documents
+from src.services.reranker import rerank
 from src.services.cache import cache_get, cache_set
 from src.db.session import SessionLocal
 from src.db.models import QueryLog
@@ -23,11 +24,14 @@ def generate_rag_answer(user_id: str, query: str, top_k: int = 5):
 
     start_time = time.time()
 
-    # 🔹 2. Retrieve chunks
-    retrieved_chunks = retrieve_documents(user_id, query, top_k)
+    # 🔹 2. Retrieve chunks (over-fetch for reranking)
+    retrieved_chunks = retrieve_documents(user_id, query, top_k=top_k * 3)
 
     if not retrieved_chunks:
         return {"answer": "No relevant information found.", "sources": []}
+
+    # 🔹 2.5. Rerank to get the best top_k
+    retrieved_chunks = rerank(query, retrieved_chunks, top_k=top_k)
 
     # 🔹 3. Build context
     context_text = "\n\n".join(
