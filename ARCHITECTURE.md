@@ -12,28 +12,31 @@
                           │        FastAPI Application        │
                           │          (src/main.py)            │
                           │                                    │
-                          │  POST /upload    GET /health       │
-                          │  POST /query     GET /check-conn   │
-                          │  POST /rag                         │
+                          │  POST /register   GET /health      │
+                          │  POST /login      GET /check-conn  │
+                          │  POST /upload     POST /query      │
+                          │  POST /upload-file POST /rag       │
                           └──┬──────┬──────┬─────────────────┘
                              │      │      │
               ┌──────────────┘      │      └──────────────┐
               ▼                     ▼                      ▼
    ┌─────────────────┐  ┌─────────────────┐   ┌─────────────────┐
-   │  Rate Limiter    │  │  Retrieval      │   │  RAG Service     │
-   │  (Redis)         │  │  Service        │   │  (Orchestrator)  │
+   │  Auth Service    │  │  Retrieval      │   │  RAG Service     │
+   │  (JWT + bcrypt)  │  │  Service        │   │  (Orchestrator)  │
    └─────────────────┘  └────────┬────────┘   └───┬─────┬───────┘
                                  │                 │     │
-                                 │                 │     ▼
-                                 │                 │  ┌──────────────┐
-                                 │                 │  │  Reranker     │
-                                 │                 │  │  (bge-base)   │
+   ┌─────────────────┐          │                 │     ▼
+   │  Rate Limiter    │          │                 │  ┌──────────────┐
+   │  (Redis)         │          │                 │  │  Reranker     │
+   └─────────────────┘          │                 │  │  (bge-base)   │
                                  │                 │  └──────────────┘
-                                 │                 │
-                                 ▼                 ▼
+   ┌─────────────────┐          │                 │
+   │  File Parser     │          │                 │
+   │  (PDF/DOCX/TXT)  │          │                 │
+   └─────────────────┘          ▼                 ▼
                           ┌─────────────────────────────┐
-                          │       OpenAI API             │
-                          │  Embeddings + Chat (GPT-4o)  │
+                          │       OpenRouter API          │
+                          │  Embeddings + Gemini Flash    │
                           └─────────────────────────────┘
               ┌──────────────────────────────────────────────┐
               │               Infrastructure                  │
@@ -45,8 +48,8 @@
               │  └──────────┘  └──────────┘  └──────────┘    │
               │                                                │
               │  ┌──────────────────────────────────────┐     │
-              │  │  Celery Worker (Redis broker)         │     │
-              │  │  Async document ingestion              │     │
+              │  │  ARQ Worker (Redis broker)             │     │
+              │  │  Async document ingestion               │     │
               │  └──────────────────────────────────────┘     │
               └──────────────────────────────────────────────┘
 ```
@@ -61,25 +64,31 @@ advanced_rag/
 │   ├── main.py                  # FastAPI app, route definitions, startup hooks
 │   ├── db/
 │   │   ├── models.py            # SQLAlchemy ORM models (User, Document, Chunk, QueryLog)
-│   │   └── session.py           # Database engine & session factory
+│   │   └── session.py           # Database engine, connection pool & session factory
 │   ├── services/
+│   │   ├── auth.py              # JWT authentication (register, login, token validation)
 │   │   ├── cache.py             # Redis get/set with JSON serialization
 │   │   ├── chunking.py          # Sliding-window text chunking
-│   │   ├── embeddings.py        # OpenAI embedding generation
+│   │   ├── embeddings.py        # Embedding generation (OpenRouter)
+│   │   ├── file_parser.py       # Text extraction (PDF, DOCX, TXT)
 │   │   ├── ingestion.py         # Document processing pipeline
-│   │   ├── rag.py               # RAG orchestration (retrieve → rerank → generate)
+│   │   ├── logging.py           # Structured JSON logging (structlog)
+│   │   ├── rag.py               # RAG orchestration (retrieve -> rerank -> generate)
 │   │   ├── rate_limiter.py      # Per-user rate limiting via Redis
 │   │   ├── reranker.py          # Cross-encoder reranking (BAAI/bge-reranker-base)
 │   │   ├── retrieval.py         # Vector search + chunk text fetching
 │   │   └── vector_store.py      # Qdrant client & collection management
 │   └── worker/
-│       ├── celery_app.py        # Celery configuration
-│       └── tasks.py             # Async task: process_document
+│       ├── celery_app.py        # ARQ Redis settings helper
+│       └── tasks.py             # ARQ task: process_document + WorkerSettings
 ├── tests/
-│   └── test_pipeline.py         # End-to-end integration test
+│   └── test_pipeline.py         # Integration tests (auth + full pipeline)
 ├── docker-compose.yml           # Qdrant, PostgreSQL, Redis containers
 ├── pyproject.toml               # Dependencies & project metadata
+├── run_prod.sh                  # Production startup (Gunicorn + Uvicorn workers)
 ├── .env                         # Environment variables
+├── ARCHITECTURE.md              # This file
+├── PLAN.md                      # Pipeline plan & design decisions
 └── README.md                    # Setup & usage guide
 ```
 
@@ -89,49 +98,80 @@ advanced_rag/
 
 ### API Layer (`src/main.py`)
 
-The FastAPI application exposes five endpoints and runs startup initialization (table creation, Qdrant collection setup).
+The FastAPI application exposes eight endpoints and runs startup initialization (table creation, Qdrant collection setup, ARQ pool creation).
 
 | Endpoint | Method | Description | Auth | Rate Limit |
 |----------|--------|-------------|------|------------|
-| `/upload` | POST | Queue document for async ingestion | user_id | 5/min |
-| `/query` | POST | Retrieve relevant chunks | user_id | None |
-| `/rag` | POST | Generate answer from documents | user_id | 20/min |
+| `/register` | POST | Create user account | None | None |
+| `/login` | POST | Authenticate and get JWT | None | None |
+| `/upload` | POST | Queue text document for async ingestion | JWT | 5/min |
+| `/upload-file` | POST | Upload PDF/DOCX/TXT file for ingestion | JWT | 5/min |
+| `/query` | POST | Retrieve relevant chunks | JWT | None |
+| `/rag` | POST | Generate answer from documents | JWT | 20/min |
 | `/health` | GET | Liveness check | None | None |
 | `/check-connections` | GET | Verify all service connections | None | None |
 
+### Authentication (`src/services/auth.py`)
+
+JWT-based authentication flow:
+
+```
+Register: email + password -> bcrypt hash -> store User -> return JWT
+Login:    email + password -> verify hash -> return JWT
+Request:  Authorization: Bearer <token> -> decode JWT -> extract user_id
+```
+
+- Tokens expire after 24 hours (configurable via `JWT_EXPIRY_HOURS`)
+- Passwords hashed with bcrypt (salt rounds auto-generated)
+- `get_current_user` FastAPI dependency protects all data endpoints
+
 ### Database Layer (`src/db/`)
 
-**Engine**: PostgreSQL via SQLAlchemy ORM
+**Engine**: PostgreSQL via SQLAlchemy ORM with connection pooling (`pool_size=20`, `max_overflow=10`, `pool_pre_ping=True`, `pool_recycle=300s`)
 
 #### Entity-Relationship Diagram
 
 ```
-┌───────────────┐       ┌───────────────────┐       ┌───────────────────┐
-│     User      │       │     Document      │       │      Chunk        │
-├───────────────┤       ├───────────────────┤       ├───────────────────┤
-│ id (UUID, PK) │──1:N─▶│ id (UUID, PK)     │──1:N─▶│ id (UUID, PK)     │
-│ email         │       │ user_id (FK)      │       │ document_id (FK)  │
-│ created_at    │       │ filename          │       │ user_id (FK)      │
-└───────────────┘       │ status            │       │ text              │
-                        │ created_at        │       │ embedding_id      │
-                        └───────────────────┘       │ created_at        │
-                                                    └───────────────────┘
-
+┌───────────────────┐       ┌───────────────────┐       ┌───────────────────┐
+│       User        │       │     Document      │       │      Chunk        │
+├───────────────────┤       ├───────────────────┤       ├───────────────────┤
+│ id (UUID, PK)     │──1:N─>│ id (UUID, PK)     │──1:N─>│ id (UUID, PK)     │
+│ email (idx)       │       │ user_id (FK, idx)  │       │ document_id (FK,idx)│
+│ password_hash     │       │ filename          │       │ user_id (FK, idx)  │
+│ created_at        │       │ status            │       │ text              │
+└───────────────────┘       │ created_at        │       │ embedding_id (idx) │
+        │                   │ updated_at        │       │ created_at        │
+        │                   └───────────────────┘       └───────────────────┘
+        │
+        │ 1:N
+        ▼
 ┌───────────────────┐
 │    QueryLog       │
 ├───────────────────┤
 │ id (UUID, PK)     │
-│ user_id           │
+│ user_id (FK, idx) │
 │ query_text        │
-│ response_time_ms  │
+│ response_time_ms  │  (Float)
 │ created_at        │
 └───────────────────┘
 ```
 
-- **Document.status**: `processing` → `ready` | `failed`
+- **Document.status**: `processing` -> `ready` | `failed`
 - **Chunk.embedding_id**: Links to the corresponding vector in Qdrant
+- All foreign keys use `ondelete="CASCADE"` — deleting a user cascades to documents, chunks, and query logs
+- Indexes on all foreign keys and `email` for query performance
 
 ### Service Layer (`src/services/`)
+
+#### File Parser (`file_parser.py`)
+
+Extracts text from uploaded files:
+
+| Format | Library | Method |
+|--------|---------|--------|
+| PDF | PyMuPDF (`fitz`) | Page-by-page text extraction |
+| DOCX | python-docx | Paragraph extraction |
+| TXT | Built-in | UTF-8 decode |
 
 #### Ingestion Pipeline (`ingestion.py`)
 
@@ -142,7 +182,7 @@ Text Input
     │
     ▼
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  chunk_text   │───▶│  generate    │───▶│  upsert to   │
+│  chunk_text   │───>│  generate    │───>│  upsert to   │
 │  (500 chars,  │    │  embedding   │    │  Qdrant      │
 │   50 overlap) │    │  per chunk   │    │  (vectors)   │
 └──────────────┘    └──────────────┘    └──────────────┘
@@ -155,13 +195,13 @@ Text Input
                                         └──────────────┘
 ```
 
-Runs inside a **Celery worker** for non-blocking uploads.
+Runs inside an **ARQ worker** for non-blocking uploads.
 
 #### Retrieval (`retrieval.py`)
 
 Performs user-scoped semantic search:
 
-1. Generate query embedding via OpenAI
+1. Generate query embedding via OpenRouter
 2. Search Qdrant with `user_id` filter (cosine similarity)
 3. Fetch chunk text from PostgreSQL by `embedding_id`
 4. Return scored results: `[{score, text, document_id, chunk_index}]`
@@ -182,6 +222,7 @@ Output: Top-K chunks sorted by relevance score
 
 - Loaded once at module import (model stays in memory)
 - Adds `rerank_score` field to each document
+- Handles single-document edge case (0-d tensor)
 - Used in the RAG pipeline to refine vector search results
 
 #### RAG Orchestrator (`rag.py`)
@@ -191,23 +232,23 @@ Ties everything together for the `/rag` endpoint:
 ```
 Query
   │
-  ├──▶ Cache check (Redis)
-  │         │ hit → return cached answer
+  ├──> Cache check (Redis)
+  │         │ hit -> return cached answer
   │         │ miss ↓
   │
-  ├──▶ retrieve_documents(top_k * 3)   ← over-fetch
+  ├──> retrieve_documents(top_k * 3)   <- over-fetch
   │
-  ├──▶ rerank(query, chunks, top_k)    ← refine
+  ├──> rerank(query, chunks, top_k)    <- refine
   │
-  ├──▶ Build context string
+  ├──> Build context string
   │
-  ├──▶ GPT-4o-mini completion
+  ├──> Gemini 2.0 Flash completion (via OpenRouter)
   │
-  ├──▶ Cache answer (300s TTL)
+  ├──> Cache answer (300s TTL)
   │
-  ├──▶ Log to QueryLog (latency)
+  ├──> Log to QueryLog (latency as Float)
   │
-  └──▶ Return {answer, sources}
+  └──> Return {answer, sources}
 ```
 
 #### Caching (`cache.py`)
@@ -228,41 +269,54 @@ Key: rate_limit:{user_id}:{action}
 Operation: INCR + EXPIRE (atomic)
 ```
 
+#### Structured Logging (`logging.py`)
+
+JSON logging via structlog, configured at app startup:
+
+- ISO timestamps
+- Log level and logger name
+- Exception formatting
+- Context variables (user_id, endpoint, job_id)
+
 ### Worker Layer (`src/worker/`)
 
-Celery application with Redis as both broker and result backend.
+ARQ application with Redis as both broker and result backend.
 
 ```
 /upload endpoint
       │
       ▼
-  celery.send_task("process_document")
+  arq_pool.enqueue_job("process_document")
       │
       ▼
-  Redis Queue ──▶ Celery Worker ──▶ ingest_document()
+  Redis Queue ──> ARQ Worker ──> ingest_document()
 ```
 
-Workers can be scaled horizontally by running multiple instances.
+Configuration (`WorkerSettings`):
+- `max_jobs`: 10 concurrent jobs
+- `job_timeout`: 300 seconds per ingestion task
+- Workers can be scaled by running multiple `arq` processes
 
 ---
 
 ## Data Flow: End-to-End Query
 
 ```
-1. Client sends POST /rag {user_id, query, top_k=5}
-2. Rate limiter checks: ≤20 requests/min for this user?
-3. Cache lookup: rag:{user_id}:{query}:5
-4. Cache miss → retrieve_documents(user_id, query, top_k=15)
-   4a. Cache lookup: retrieval:{user_id}:{query}:15
-   4b. Cache miss → embed query → search Qdrant (cosine, user_id filter)
-   4c. Fetch chunk text from PostgreSQL
-   4d. Cache retrieval results
-5. Rerank 15 candidates → return top 5
-6. Concatenate top-5 chunk texts into context
-7. Prompt GPT-4o-mini: system message + context + question
-8. Cache {answer, sources} in Redis
-9. Log query + latency to PostgreSQL
-10. Return response to client
+1. Client sends POST /rag with JWT Bearer token
+2. Auth middleware validates JWT, extracts user_id
+3. Rate limiter checks: <=20 requests/min for this user?
+4. Cache lookup: rag:{user_id}:{query}:5
+5. Cache miss -> retrieve_documents(user_id, query, top_k=15)
+   5a. Cache lookup: retrieval:{user_id}:{query}:15
+   5b. Cache miss -> embed query via OpenRouter -> search Qdrant (cosine, user_id filter)
+   5c. Fetch chunk text from PostgreSQL
+   5d. Cache retrieval results
+6. Rerank 15 candidates -> return top 5
+7. Concatenate top-5 chunk texts into context
+8. Prompt Gemini 2.0 Flash (via OpenRouter): system message + context + question
+9. Cache {answer, sources} in Redis
+10. Log query + latency (Float) to PostgreSQL
+11. Return response to client
 ```
 
 ---
@@ -273,21 +327,23 @@ Workers can be scaled horizontally by running multiple instances.
 |---------|-------|------|--------|---------|
 | Qdrant | `qdrant/qdrant` | 6333 | `qdrant_data` | Vector storage & ANN search |
 | PostgreSQL | `postgres:15` | 5433 | `pgdata` | Relational data (users, docs, chunks, logs) |
-| Redis | `redis:7` | 6379 | — | Cache, rate limiting, Celery broker |
+| Redis | `redis:7` | 6379 | — | Cache, rate limiting, ARQ broker |
 
-All services are containerized. The FastAPI app and Celery worker run on the host.
+All services are containerized. The FastAPI app and ARQ worker run on the host (or via Gunicorn in production).
 
 ---
 
-## Security Considerations
+## Security
 
-| Area | Current State | Notes |
-|------|---------------|-------|
-| Authentication | Trust-based (client sends `user_id`) | Should add JWT/OAuth |
-| Data Isolation | Qdrant queries filtered by `user_id` | Enforced at retrieval layer |
-| API Keys | Stored in `.env` file | Not committed to git |
-| Rate Limiting | Per-user via Redis | Prevents abuse |
-| Input Validation | Pydantic request models | Basic field validation |
+| Area | Implementation | Details |
+|------|---------------|---------|
+| Authentication | JWT (PyJWT) | 24h expiry, HS256 algorithm |
+| Password Storage | bcrypt | Auto-generated salt, hash stored in PostgreSQL |
+| Data Isolation | Qdrant user_id filter | Enforced at retrieval layer |
+| API Keys | `.env` file | Not committed to git (in `.gitignore`) |
+| Rate Limiting | Per-user via Redis | Prevents abuse (5 uploads/min, 20 queries/min) |
+| Input Validation | Pydantic models | Type-safe request parsing |
+| DB Integrity | CASCADE deletes + FK constraints | No orphaned records |
 
 ---
 
@@ -295,10 +351,14 @@ All services are containerized. The FastAPI app and Celery worker run on the hos
 
 1. **Retrieve-then-Rerank**: Fetch 3x candidates from vector search, then rerank to top_k. This balances recall (bi-encoder) with precision (cross-encoder).
 
-2. **User-scoped everything**: All Qdrant searches include a `user_id` filter. Documents, chunks, and queries are all tied to a user.
+2. **User-scoped everything**: All Qdrant searches include a `user_id` filter. Documents, chunks, and queries are all tied to an authenticated user.
 
-3. **Async ingestion**: Document processing (chunking + embedding) is CPU/IO-intensive. Celery decouples upload latency from processing time.
+3. **Async ingestion via ARQ**: Document processing (text extraction + chunking + embedding) is CPU/IO-intensive. ARQ decouples upload latency from processing time, with async-native Python support and simpler config than Celery.
 
 4. **Two-level caching**: Both retrieval and RAG answers are cached separately. A cache hit at the RAG level skips everything; a cache hit at retrieval still runs reranking + LLM (cheaper than re-embedding + vector search).
 
 5. **Local reranker**: The BGE cross-encoder runs on the host (CPU/GPU), avoiding external API calls and keeping reranking fast and free.
+
+6. **JWT authentication**: Stateless tokens eliminate the need for session storage. The `get_current_user` dependency injects user_id into every protected endpoint, replacing the old trust-based `user_id` parameter.
+
+7. **OpenRouter as LLM gateway**: Single API for both embeddings (OpenAI models) and chat completions (Gemini Flash), avoiding multiple API key management.
