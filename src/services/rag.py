@@ -12,7 +12,8 @@ load_dotenv()
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    timeout=60.0,
 )
 MODEL_NAME = "google/gemini-2.0-flash-001"
 
@@ -83,16 +84,18 @@ Answer:
     # 🔹 5. Cache final result
     cache_set(cache_key, result)
 
-    # 🔹 6. Log query
-    latency = int((time.time() - start_time) * 1000)
+    # 6. Log query
+    latency = (time.time() - start_time) * 1000
 
     db = SessionLocal()
-    db.add(QueryLog(
-        user_id=user_id,
-        query_text=query,
-        response_time_ms=latency
-    ))
-    db.commit()
-    db.close()
+    try:
+        db.add(QueryLog(
+            user_id=user_id,
+            query_text=query,
+            response_time_ms=latency
+        ))
+        db.commit()
+    finally:
+        db.close()
 
     return result

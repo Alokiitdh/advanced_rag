@@ -1,4 +1,5 @@
 import os
+import asyncio
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from qdrant_client import QdrantClient
 import psycopg2
@@ -107,11 +108,12 @@ async def upload_file(
 
 
 @app.post("/query")
-def query_documents(
+async def query_documents(
     request: QueryRequest,
     user_id: str = Depends(get_current_user),
 ):
-    results = retrieve_documents(
+    results = await asyncio.to_thread(
+        retrieve_documents,
         user_id=user_id,
         query=request.query,
         top_k=request.top_k,
@@ -121,7 +123,7 @@ def query_documents(
 
 
 @app.post("/rag")
-def rag_query(
+async def rag_query(
     request: QueryRequest,
     user_id: str = Depends(get_current_user),
 ):
@@ -129,7 +131,8 @@ def rag_query(
     if not allowed:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    result = generate_rag_answer(
+    result = await asyncio.to_thread(
+        generate_rag_answer,
         user_id=user_id,
         query=request.query,
         top_k=request.top_k,
