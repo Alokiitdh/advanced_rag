@@ -1,12 +1,13 @@
 import os
 import asyncio
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from qdrant_client import QdrantClient
 import psycopg2
 import redis
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from src.db.session import engine, Base
+from src.db.session import engine, Base, SessionLocal
 from src.db import models
 from src.services.vector_store import create_collection
 from src.services.retrieval import retrieve_documents
@@ -23,6 +24,14 @@ setup_logging()
 logger = get_logger("api")
 
 app = FastAPI(title="Advanced RAG API", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 arq_pool = None
 
 
@@ -142,6 +151,42 @@ async def rag_query(
 
 
 # --- Public endpoints ---
+
+@app.get("/documents")
+def get_documents(user_id: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        docs = db.query(models.Document).filter(
+            models.Document.user_id == user_id
+        ).order_by(models.Document.created_at.desc()).all()
+        return [
+            {
+                "id": str(d.id),
+                "filename": d.filename,
+                "status": d.status,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+            }
+            for d in docs
+        ]
+    finally:
+        db.close()
+
+
+@app.get("/me")
+def get_me(user_id: str = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {
+            "id": str(user.id),
+            "email": user.email,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        }
+    finally:
+        db.close()
+
 
 @app.get("/health")
 async def health():
