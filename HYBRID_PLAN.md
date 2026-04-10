@@ -1,484 +1,293 @@
-# Hybrid Deployment Plan: Vercel + Mac Mini
+# Hybrid Deployment Plan: Vercel (Frontend) + Mac Mini 4 (Backend)
 
 ## Overview
 
-Split the monolithic FastAPI RAG backend into two independently deployed apps:
+Deploy the React frontend as a static site on Vercel and run the **entire** FastAPI backend (API, worker, databases, AI models) on a Mac Mini M4 in the office.
 
 | Layer | Where | What |
 |---|---|---|
-| Light backend | Vercel Serverless | Auth, upload, routing |
-| AI inference | Mac Mini (Cloudflare Tunnel) | Reranker, Qdrant, embeddings, LLM |
-| Database | Neon (managed, free) | PostgreSQL |
-| Cache / Queue | Upstash (managed, free) | Redis |
+| Frontend | Vercel (static site) | React + Vite SPA |
+| Backend API | Mac Mini 4 | FastAPI (auth, upload, query, RAG) |
+| AI Inference | Mac Mini 4 | Reranker (PyTorch), embeddings & LLM (OpenRouter) |
+| Databases | Mac Mini 4 (Docker) | PostgreSQL, Qdrant, Redis |
+| Worker | Mac Mini 4 | ARQ worker for async document ingestion |
+| Tunnel | Cloudflare Tunnel | Exposes Mac Mini API with HTTPS |
 
-**Why split?** The local reranker (`BAAI/bge-reranker-base`) requires PyTorch (~550MB). Vercel has a 50MB bundle limit. Qdrant also runs locally. Everything else moves to managed free-tier services.
+**Why this approach?** No code splitting needed. The Mac Mini M4 has plenty of power to run everything — reranker model, vector DB, Postgres, Redis, and the API. Vercel serves the static frontend for free with global CDN. Cloudflare Tunnel provides free HTTPS without port forwarding.
 
 ---
 
 ## Architecture
 
 ```
-Client
-  └─► Vercel Serverless (vercel_app/)
-        ├── POST /register          → Neon PostgreSQL
-        ├── POST /login             → Neon PostgreSQL
-        ├── POST /upload            → Upstash Redis (ARQ job queue)
-        ├── POST /upload-file       → Upstash Redis (ARQ job queue)
-        ├── GET  /health            → static response
-        ├── POST /query  ───────────────────────────────────────┐
-        └── POST /rag    ───────────────────────────────────────┤
-                                     Cloudflare Tunnel (HTTPS)  │
-                                                                 ▼
-                                          Mac Mini (inference_server/)
-                                            POST /infer/query
-                                            POST /infer/rag
-                                            GET  /infer/health
-                                            ├── Qdrant (local Docker)
-                                            ├── Reranker (local PyTorch)
-                                            ├── Embeddings (OpenRouter API)
-                                            └── LLM (Gemini via OpenRouter)
-
-Mac Mini also runs:
-  └── ARQ Worker → polls Upstash Redis → processes ingestion jobs
+Users (browser)
+    │
+    ▼
+Vercel CDN (React SPA)
+    │
+    │  HTTPS (API calls)
+    ▼
+Cloudflare Tunnel ──► Mac Mini 4 (office)
+                         │
+                    Nginx (port 443)
+                         │
+                    FastAPI (port 8000)
+                         │
+                  ┌──────┼──────────┐
+                  ▼      ▼          ▼
+               Qdrant  Postgres   Redis ← ARQ Worker
 ```
 
 ---
 
 ## What Runs Where
 
-### On Vercel (serverless functions)
-- User registration & login (JWT auth)
-- Document upload (queues jobs to Upstash Redis)
-- `/query` and `/rag` — **proxy only** to Mac Mini inference server
-- No AI, no Qdrant, no PyTorch
+### On Vercel (static site — free tier)
+- React + Vite SPA served via global CDN
+- No serverless functions, no backend logic
+- `VITE_API_URL` points to Mac Mini's Cloudflare Tunnel URL
 
-### On Mac Mini
-- **Inference server** (FastAPI, port 8001) — handles all AI work
-- **ARQ worker** — processes document ingestion jobs from Upstash queue
+### On Mac Mini 4 (everything else)
+- **FastAPI** — all API routes (auth, upload, query, RAG)
+- **ARQ worker** — async document ingestion
+- **PostgreSQL** (Docker) — users, documents, chunks, query logs
+- **Redis** (Docker) — cache, rate limiting, job queue
 - **Qdrant** (Docker) — vector database
-
-### Managed Services (free tier)
-- **Neon** — PostgreSQL (users, chunks, query logs)
-- **Upstash** — Redis (cache, rate limiting, ARQ job queue)
-
----
-
-## New Directory Structure
-
-```
-advanc_rag/
-├── advanced_rag/               (existing — keep as reference)
-│
-├── vercel_app/                 (NEW — Vercel light backend)
-│   ├── api/
-│   │   └── index.py            (Vercel ASGI entry point)
-│   ├── src/
-│   │   ├── db/
-│   │   │   ├── models.py       (same ORM models)
-│   │   │   └── session.py      (MODIFIED: NullPool for serverless)
-│   │   └── services/
-│   │       ├── auth.py         (unchanged)
-│   │       ├── cache.py        (unchanged)
-│   │       ├── file_parser.py  (unchanged)
-│   │       ├── logging.py      (unchanged)
-│   │       ├── rate_limiter.py (unchanged)
-│   │       └── inference_client.py  (NEW — httpx proxy to Mac Mini)
-│   ├── requirements.txt        (no torch / transformers / qdrant-client)
-│   └── vercel.json
-│
-└── inference_server/           (NEW — Mac Mini FastAPI app)
-    ├── src/
-    │   ├── main.py             (NEW — /infer/* routes + secret middleware)
-    │   ├── db/
-    │   │   ├── models.py       (unchanged)
-    │   │   └── session.py      (unchanged)
-    │   └── services/
-    │       ├── auth.py
-    │       ├── cache.py
-    │       ├── chunking.py
-    │       ├── embeddings.py
-    │       ├── file_parser.py
-    │       ├── ingestion.py
-    │       ├── logging.py
-    │       ├── rag.py
-    │       ├── rate_limiter.py
-    │       ├── reranker.py     (stays here — PyTorch runs on Mac Mini)
-    │       ├── retrieval.py
-    │       └── vector_store.py
-    ├── worker/
-    │   ├── celery_app.py       (MODIFIED: add rediss:// TLS support)
-    │   └── tasks.py            (unchanged)
-    ├── docker-compose.yml      (MODIFIED: Qdrant only)
-    ├── run_inference.sh        (NEW)
-    └── run_worker.sh           (NEW)
-```
+- **Reranker** — BAAI/bge-reranker-base (local PyTorch)
+- **Embeddings + LLM** — via OpenRouter API
+- **Nginx** — reverse proxy, SSL termination
+- **Cloudflare Tunnel** — public HTTPS endpoint
 
 ---
 
-## Files to Create / Modify
+## Changes Required
 
-### NEW: `vercel_app/src/services/inference_client.py`
-The HTTP bridge from Vercel to Mac Mini. Most critical new file.
+Only 3 minor code changes + 2 new config files. No code splitting, no new services.
 
-```python
-import os
-import httpx
-from fastapi import HTTPException
+### 1. NEW: `advanced_rag_fe/vercel.json`
 
-INFERENCE_SERVER_URL = os.getenv("INFERENCE_SERVER_URL")
-INFERENCE_SECRET = os.getenv("INFERENCE_SECRET")
+SPA rewrites so React Router works on Vercel:
 
-
-async def _post(path: str, payload: dict) -> dict:
-    if not INFERENCE_SERVER_URL:
-        raise HTTPException(status_code=503, detail="Inference server not configured")
-    url = f"{INFERENCE_SERVER_URL.rstrip('/')}{path}"
-    headers = {"X-Inference-Secret": INFERENCE_SECRET, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            r = await client.post(url, json=payload, headers=headers)
-            r.raise_for_status()
-            return r.json()
-        except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Inference server timed out")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Inference server unreachable")
-
-
-async def proxy_query(user_id: str, query: str, top_k: int) -> dict:
-    return await _post("/infer/query", {"user_id": user_id, "query": query, "top_k": top_k})
-
-
-async def proxy_rag(user_id: str, query: str, top_k: int) -> dict:
-    return await _post("/infer/rag", {"user_id": user_id, "query": query, "top_k": top_k})
-```
-
----
-
-### NEW: `inference_server/src/main.py`
-Mac Mini FastAPI app with shared-secret middleware.
-
-```python
-import os
-from fastapi import FastAPI
-from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-import asyncio
-from src.services.rag import generate_rag_answer
-from src.services.retrieval import retrieve_documents
-from src.services.vector_store import create_collection
-from src.db.session import engine, Base
-
-INFERENCE_SECRET = os.getenv("INFERENCE_SECRET")
-
-
-class SecretMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/infer/health":
-            return await call_next(request)
-        if request.headers.get("X-Inference-Secret") != INFERENCE_SECRET:
-            return Response("Forbidden", status_code=403)
-        return await call_next(request)
-
-
-app = FastAPI(title="RAG Inference Server")
-app.add_middleware(SecretMiddleware)
-
-
-@app.on_event("startup")
-async def startup():
-    Base.metadata.create_all(bind=engine)
-    create_collection()
-
-
-@app.get("/infer/health")
-async def health():
-    return {"status": "running", "service": "inference"}
-
-
-@app.post("/infer/query")
-async def infer_query(request: InferRequest):
-    results = await asyncio.to_thread(
-        retrieve_documents, request.user_id, request.query, request.top_k
-    )
-    return {"results": results}
-
-
-@app.post("/infer/rag")
-async def infer_rag(request: InferRequest):
-    return await asyncio.to_thread(
-        generate_rag_answer, request.user_id, request.query, request.top_k
-    )
-```
-
----
-
-### MODIFIED: `vercel_app/api/index.py`
-- `/query` and `/rag` call `inference_client.proxy_*` instead of services directly
-- Rate limiting for `/rag` still checked on Vercel (fast Redis call before Mac Mini round-trip)
-- ARQ pool initialized lazily (serverless has no persistent startup)
-- No `create_collection()` or `Base.metadata.create_all()` on startup
-
----
-
-### MODIFIED: `vercel_app/src/db/session.py`
-```python
-# NullPool is critical — serverless functions cannot maintain connection pools
-engine = create_engine(DATABASE_URL, poolclass=NullPool)
-```
-
----
-
-### MODIFIED: `inference_server/worker/celery_app.py`
-Add TLS support for Upstash `rediss://` URLs:
-```python
-ssl = REDIS_URL.startswith("rediss://")
-clean_url = REDIS_URL.replace("rediss://", "").replace("redis://", "")
-# pass ssl=ssl to RedisSettings(...)
-```
-
----
-
-### MODIFIED: `inference_server/docker-compose.yml`
-Qdrant only — postgres and redis removed (now managed):
-```yaml
-services:
-  qdrant:
-    image: qdrant/qdrant
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-    restart: unless-stopped
-
-volumes:
-  qdrant_data:
-```
-
----
-
-### NEW: `vercel_app/vercel.json`
 ```json
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": { "maxLambdaSize": "50mb" }
-    }
-  ],
-  "functions": {
-    "api/index.py": { "maxDuration": 60 }
-  },
-  "routes": [
-    { "src": "/(.*)", "dest": "api/index.py" }
-  ]
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
 ```
-> `maxDuration: 60` requires **Vercel Pro** plan. RAG calls take 10–30s — the free tier's 10s limit will time out.
+
+### 2. NEW: `advanced_rag_fe/.env.production`
+
+```env
+VITE_API_URL=https://rag-api.yourdomain.com
+```
+
+No code changes needed — `src/lib/constants.ts` already reads from `import.meta.env.VITE_API_URL`.
+
+### 3. MODIFIED: `advanced_rag/src/main.py` (line 29-33)
+
+Update CORS to allow both local dev and the Vercel production domain:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        os.getenv("FRONTEND_URL", "https://your-app.vercel.app"),
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+### 4. MODIFIED: `advanced_rag/.env`
+
+Add `FRONTEND_URL` so CORS is configurable without code changes:
+
+```env
+POSTGRES_URL=postgresql://raguser:ragpass@postgres:5432/ragdb
+REDIS_URL=redis://redis:6379
+QDRANT_URL=http://qdrant:6333
+OPENROUTER_API_KEY=sk-or-v1-...
+JWT_SECRET=<generate-secure-random>
+FRONTEND_URL=https://your-app.vercel.app
+```
 
 ---
 
-### NEW: `vercel_app/requirements.txt`
+## Mac Mini 4 Setup
+
+### Step 1: Install Docker Desktop
+
+Download Docker Desktop for Mac from docker.com and install it. The M4 chip uses ARM images natively.
+
+### Step 2: Clone & Configure
+
+```bash
+git clone git@github.com:Alokiitdh/advanced_rag.git
+cd advanced_rag
+
+# Create production .env
+cp .env .env.prod
+# Edit .env.prod with production values (real JWT_SECRET, FRONTEND_URL, etc.)
 ```
-fastapi>=0.128.0
-uvicorn>=0.40.0
-httpx>=0.28.1
-sqlalchemy>=2.0.46
-psycopg2-binary>=2.9.11
-arq>=0.26.1
-redis>=4.2.0,<6
-PyJWT>=2.8.0
-bcrypt>=4.0.0
-python-dotenv>=1.2.1
-python-multipart>=0.0.9
-PyMuPDF>=1.24.0
-python-docx>=1.1.0
-structlog>=24.0.0
+
+### Step 3: Start Services
+
+Use the existing `docker-compose.prod.yml` — it already has everything:
+
+```bash
+# Build and start all services
+docker compose -f docker-compose.prod.yml up -d
+
+# Verify
+docker compose -f docker-compose.prod.yml ps
+curl http://localhost:8000/health
+curl http://localhost:8000/check-connections
 ```
-**Excluded:** `torch`, `transformers`, `qdrant-client` — these stay on Mac Mini only.
+
+### Step 4: Install Cloudflare Tunnel
+
+```bash
+# Install
+brew install cloudflared
+
+# Authenticate (opens browser — login to your Cloudflare account)
+cloudflared tunnel login
+
+# Create a named tunnel
+cloudflared tunnel create rag-api
+# → prints TUNNEL-UUID
+```
+
+Create `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <TUNNEL-UUID>
+credentials-file: /Users/alokj/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: rag-api.yourdomain.com
+    service: http://localhost:8000
+  - service: http_status:404
+```
+
+Add DNS record (Cloudflare dashboard or CLI):
+
+```bash
+cloudflared tunnel route dns rag-api rag-api.yourdomain.com
+```
+
+Install as a macOS LaunchAgent (auto-starts on reboot):
+
+```bash
+sudo cloudflared service install
+```
+
+Or run manually:
+
+```bash
+cloudflared tunnel run rag-api
+```
+
+**Quick test (no domain needed):**
+
+```bash
+cloudflared tunnel --url http://localhost:8000
+# Prints a temporary trycloudflare.com URL — use this for testing
+```
+
+### Step 5: Auto-start on Boot
+
+Create a launchd plist so Docker Compose starts automatically:
+
+```bash
+# Docker Desktop starts on login by default
+# The Cloudflare Tunnel service is already installed above
+
+# For extra reliability, use the systemd approach from DEPLOY.md section 7
+# adapted for macOS launchd
+```
 
 ---
 
-### NEW: `inference_server/run_inference.sh`
-```bash
-#!/bin/bash
-set -e
-cd "$(dirname "$0")"
-source .env
-gunicorn src.main:app \
-    --worker-class uvicorn.workers.UvicornWorker \
-    --workers 2 \
-    --bind 0.0.0.0:8001 \
-    --timeout 180 \
-    --graceful-timeout 30
-```
+## Vercel Frontend Deployment
 
-### NEW: `inference_server/run_worker.sh`
+### Option A: Connect via GitHub (recommended)
+
+1. Push `advanced_rag_fe/` to GitHub
+2. Go to vercel.com → New Project → Import the repo
+3. Set root directory to `advanced_rag_fe`
+4. Framework preset: Vite
+5. Add environment variable: `VITE_API_URL=https://rag-api.yourdomain.com`
+6. Deploy
+
+### Option B: CLI
+
 ```bash
-#!/bin/bash
-set -e
-cd "$(dirname "$0")"
-source .env
-python -m arq src.worker.tasks.WorkerSettings
+cd advanced_rag_fe
+npm install -g vercel
+vercel login
+vercel env add VITE_API_URL  # paste: https://rag-api.yourdomain.com
+vercel deploy --prod
 ```
 
 ---
 
 ## Environment Variables
 
-### Vercel (set via `vercel env add` or dashboard)
+### Vercel (dashboard or CLI)
 
 | Variable | Value |
 |---|---|
-| `POSTGRES_URL` | Neon PostgreSQL connection string |
-| `REDIS_URL` | Upstash Redis TLS URL (`rediss://...`) |
-| `JWT_SECRET` | Same value as Mac Mini |
-| `INFERENCE_SERVER_URL` | `https://rag-infer.yourdomain.com` |
-| `INFERENCE_SECRET` | 32-byte hex: `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `VITE_API_URL` | `https://rag-api.yourdomain.com` |
 
-### Mac Mini (`inference_server/.env`)
+### Mac Mini (`advanced_rag/.env`)
 
 | Variable | Value |
 |---|---|
-| `POSTGRES_URL` | Same Neon string |
-| `REDIS_URL` | Same Upstash TLS string |
-| `JWT_SECRET` | Same value as Vercel |
-| `QDRANT_URL` | `http://localhost:6333` |
+| `POSTGRES_URL` | `postgresql://raguser:ragpass@postgres:5432/ragdb` |
+| `REDIS_URL` | `redis://redis:6379` |
+| `QDRANT_URL` | `http://qdrant:6333` |
 | `OPENROUTER_API_KEY` | Your OpenRouter key |
-| `INFERENCE_SECRET` | Same value as Vercel |
-
-> **JWT flow:** Vercel validates the JWT on `/query` and `/rag`, extracts `user_id`, and passes it in the JSON body to the Mac Mini. The Mac Mini trusts this `user_id` — it does not re-validate the token. The `INFERENCE_SECRET` header protects this trust channel.
-
----
-
-## Cloudflare Tunnel Setup (Mac Mini)
-
-```bash
-# Install
-brew install cloudflared
-
-# Authenticate (opens browser)
-cloudflared tunnel login
-
-# Create a named tunnel (persists across restarts)
-cloudflared tunnel create rag-inference
-# → saves credentials to ~/.cloudflare/tunnels/<UUID>.json
-# → prints your TUNNEL-UUID
-```
-
-Create `~/.cloudflare/config.yml`:
-```yaml
-tunnel: <TUNNEL-UUID>
-credentials-file: /Users/alokv/.cloudflare/tunnels/<TUNNEL-UUID>.json
-
-ingress:
-  - hostname: rag-infer.yourdomain.com
-    service: http://localhost:8001
-  - service: http_status:404
-```
-
-In Cloudflare DNS dashboard, add a CNAME:
-- Name: `rag-infer`
-- Target: `<TUNNEL-UUID>.cfargotunnel.com`
-
-```bash
-# Install as LaunchAgent (auto-starts on reboot)
-cloudflared service install
-
-# Or run manually
-cloudflared tunnel run rag-inference
-```
-
-**Quick test (no domain needed):**
-```bash
-cloudflared tunnel --url http://localhost:8001
-# Prints a temporary trycloudflare.com URL — use this as INFERENCE_SERVER_URL for testing
-```
-
----
-
-## Running Services on Mac Mini
-
-```bash
-# 1. Start Qdrant
-docker compose up -d qdrant
-
-# 2. Start inference server (port 8001)
-./run_inference.sh
-
-# 3. Start ARQ worker (polls Upstash for ingestion jobs)
-./run_worker.sh
-
-# 4. Start Cloudflare tunnel (if not installed as service)
-cloudflared tunnel run rag-inference
-```
+| `JWT_SECRET` | `python -c "import secrets; print(secrets.token_hex(32))"` |
+| `FRONTEND_URL` | `https://your-app.vercel.app` |
 
 ---
 
 ## Verification Steps
 
-### Phase 1 — Mac Mini local test
+### Phase 1 — Mac Mini local
+
 ```bash
-curl http://localhost:8001/infer/health
-# → {"status":"running","service":"inference"}
+curl http://localhost:8000/health
+# → {"status":"running"}
 
-curl -X POST http://localhost:8001/infer/rag \
-  -H "X-Inference-Secret: <your-secret>" \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"test","query":"hello","top_k":3}'
-# → {"answer":"...","sources":[...]}
-
-# Verify secret rejection
-curl -X POST http://localhost:8001/infer/rag \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"test","query":"hello","top_k":3}'
-# → 403 Forbidden
+curl http://localhost:8000/check-connections
+# → {"qdrant":"connected","postgres":"connected","redis":"connected"}
 ```
 
 ### Phase 2 — Cloudflare Tunnel
+
 ```bash
-curl https://rag-infer.yourdomain.com/infer/health
-# → {"status":"running","service":"inference"}
+curl https://rag-api.yourdomain.com/health
+# → {"status":"running"}
 ```
 
-### Phase 3 — Vercel local dev
-```bash
-cd vercel_app
-vercel dev
-# Set INFERENCE_SERVER_URL=https://rag-infer.yourdomain.com in .env
+### Phase 3 — Frontend on Vercel
 
-curl -X POST http://localhost:3000/register -d '{"email":"test@test.com","password":"pass"}'
-curl -X POST http://localhost:3000/login -d '{"email":"test@test.com","password":"pass"}'
-# → {"token":"..."}
+1. Open `https://your-app.vercel.app`
+2. Register a new account
+3. Upload a document (PDF/DOCX/TXT)
+4. Navigate to Chat → ask a question about the document
+5. Verify answer includes sources from the uploaded document
 
-curl -X POST http://localhost:3000/rag \
-  -H "Authorization: Bearer <token>" \
-  -d '{"query":"what is RAG?","top_k":3}'
-# → answer proxied from Mac Mini
-```
+### Phase 4 — End-to-end regression
 
-### Phase 4 — Vercel production
-```bash
-vercel env add POSTGRES_URL
-vercel env add REDIS_URL
-vercel env add JWT_SECRET
-vercel env add INFERENCE_SERVER_URL
-vercel env add INFERENCE_SECRET
-vercel deploy --prod
-```
-
-### Phase 5 — End-to-end regression
-1. Upload a document via `POST /upload-file` on Vercel
-2. Check Upstash dashboard → job appears in queue
-3. Mac Mini ARQ worker logs → `document_ingested`
-4. Check Qdrant: `curl http://localhost:6333/collections/documents` → vector count increases
-5. Run `/rag` query → answer references the uploaded document
+1. Register → Login → Upload document → Wait for "ready" status
+2. `/query` returns relevant chunks
+3. `/rag` returns generated answer with sources
+4. Rate limiting works (hit 20 RAG queries in a minute)
+5. Multiple users work independently
 
 ---
 
@@ -486,36 +295,56 @@ vercel deploy --prod
 
 | Issue | Mitigation |
 |---|---|
-| Reranker RAM: ~550MB per worker | 2 gunicorn workers = ~1.1GB total — fine on Mac Mini 16GB+ |
-| Vercel free tier timeout: 10s | Requires Vercel **Pro** for `maxDuration: 60` |
-| Upstash free tier: 10k cmds/day | Monitor usage; upgrade at ~$0.20/100k cmds |
-| PyMuPDF on Vercel Linux x86_64 | Pre-built Linux wheels available — verify in Phase 3 |
-| Reranker cold start on first request | First `/rag` call after restart may take 5–10s extra |
-| ARQ pool on Vercel is stateless | Must initialize lazily per-request, not in startup event |
-| Neon connection limit on free tier | Using NullPool + Neon's built-in PgBouncer handles this |
+| Mac Mini goes to sleep | System Settings → Energy → Prevent automatic sleeping |
+| Power outage | Docker Desktop + cloudflared auto-start on boot |
+| Reranker cold start | First `/rag` call after restart takes 5–10s extra (model loading) |
+| Reranker RAM: ~550MB per worker | 2 workers = ~1.1GB — fine on Mac Mini (16GB+) |
+| Office internet outage | API goes down; frontend on Vercel stays up (shows "Cannot reach server") |
+| CORS misconfiguration | Verify `FRONTEND_URL` matches exact Vercel domain (no trailing slash) |
+| Cloudflare Tunnel reconnect | `cloudflared` auto-reconnects; check `cloudflared tunnel info` |
+| Docker disk usage | Schedule `docker system prune` monthly |
 
 ---
 
-## Summary: What Changes vs. What Stays the Same
+## Optional Enhancements
+
+### Tailscale Funnel (alternative to Cloudflare Tunnel)
+
+Simpler setup if you don't have a domain:
+
+```bash
+brew install tailscale
+tailscale up
+tailscale funnel 8000
+# → https://mac-mini.tailnet-name.ts.net
+```
+
+### Nginx on Mac Mini (optional, recommended for production)
+
+Install via Homebrew for SSL termination and upload size limits:
+
+```bash
+brew install nginx
+# Configure as documented in DEPLOY.md section 5
+# Cloudflare Tunnel points to Nginx (port 443) instead of FastAPI directly
+```
+
+### Database Backups
+
+Use the backup scripts from DEPLOY.md section 8, adapted for macOS paths. Schedule with `launchd` instead of `cron`.
+
+---
+
+## Summary: What Changes vs. Original Monolith
 
 | Component | Status | Notes |
 |---|---|---|
-| `services/rag.py` | Unchanged | Moves to inference_server only |
-| `services/reranker.py` | Unchanged | Moves to inference_server only |
-| `services/retrieval.py` | Unchanged | Moves to inference_server only |
-| `services/vector_store.py` | Unchanged | Moves to inference_server only |
-| `services/embeddings.py` | Unchanged | Moves to inference_server only |
-| `services/auth.py` | Unchanged | Copied to both apps |
-| `services/cache.py` | Unchanged | Copied to both apps |
-| `services/rate_limiter.py` | Unchanged | Copied to both apps |
-| `services/file_parser.py` | Unchanged | Vercel only (parsing before queue) |
-| `db/models.py` | Unchanged | Copied to both apps |
-| `db/session.py` | **Modified** | NullPool on Vercel, standard on Mac Mini |
-| `worker/celery_app.py` | **Modified** | Add `rediss://` TLS support for Upstash |
-| `main.py` | **Split** | Light routes → Vercel; inference routes → Mac Mini |
-| `docker-compose.yml` | **Modified** | Qdrant only (remove postgres + redis) |
-| `inference_client.py` | **New** | httpx async bridge Vercel → Mac Mini |
-| `inference_server/main.py` | **New** | Mac Mini FastAPI with secret middleware |
-| `vercel.json` | **New** | Vercel routing + 60s timeout |
-| `run_inference.sh` | **New** | Gunicorn startup on port 8001 |
-| `run_worker.sh` | **New** | ARQ worker startup |
+| `advanced_rag/` (all backend code) | **Unchanged** | Runs as-is on Mac Mini |
+| `advanced_rag/src/main.py` | **Minor edit** | Add `FRONTEND_URL` to CORS origins |
+| `advanced_rag/.env` | **Minor edit** | Add `FRONTEND_URL` variable |
+| `advanced_rag/docker-compose.prod.yml` | **Unchanged** | Already has all services |
+| `advanced_rag_fe/` (all frontend code) | **Unchanged** | Deploys to Vercel as-is |
+| `advanced_rag_fe/vercel.json` | **New** | SPA rewrites for React Router |
+| `advanced_rag_fe/.env.production` | **New** | Production API URL |
+
+**Total changes: 2 new files, 2 minor edits. Zero code splitting.**
